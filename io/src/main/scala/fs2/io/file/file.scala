@@ -2,12 +2,12 @@ package fs2
 package io
 
 import scala.concurrent.duration._
-
 import java.nio.channels.CompletionHandler
 import java.nio.file.{Path, StandardOpenOption, WatchEvent}
 import java.util.concurrent.ExecutorService
 
 import cats.effect.{Concurrent, Effect, IO, Resource, Sync, Timer}
+import cats.effect.concurrent.Ref
 import cats.implicits._
 
 /** Provides support for working with files. */
@@ -128,4 +128,51 @@ package object file {
     Stream
       .resource(Watcher.default)
       .flatMap(w => Stream.eval_(w.watch(path, types, modifiers)) ++ w.events(pollTimeout))
+
+
+  private val modifiers: Seq[WatchEvent.Modifier] =
+    try {
+      val c = Class.forName("com.sun.nio.file.SensitivityWatchEventModifier")
+      Seq(c.getField("HIGH").get(c).asInstanceOf[WatchEvent.Modifier])
+    } catch {
+      case _: Throwable => Nil
+    }
+
+  private def fileEvents[F[_]: Concurrent](path: Path): Stream[F, Watcher.Event] =
+    file
+      .watch[F](path, modifiers = modifiers)
+      .cons1(Watcher.Event.Modified(path, 1))
+
+  private def fileHandle[F[_]: Sync](path: Path): Stream[F, FileHandle[F]] =
+    file.pulls
+      .fromPath[F](path, Seq(StandardOpenOption.READ))
+      .flatMap(e => Pull.output1(e.resource))
+      .stream
+
+  private def readAll1[F[_]](
+      handle: FileHandle[F],
+      offset: Long,
+      chunkSize: Int,
+      stream: Stream[F, Byte]
+  )(implicit F: Sync[F]): F[(Long, Stream[F, Byte])] =
+    handle.read(chunkSize, offset).flatMap {
+      case None    => F.pure((offset, stream))
+      case Some(c) => readAll1(handle, offset + c.size, chunkSize, stream ++ Stream.chunk(c))
+    }
+
+  def tail[F[_]](
+      path: Path,
+      position: Long = 0L,
+      chunkSize: Int = 4096
+  )(implicit F: Concurrent[F]): Stream[F, Byte] = {
+    for {
+      handle <- fileHandle(path)
+      offsetRef <- Stream.eval(Ref.of[F, Long](position))
+      _ <- fileEvents(path)
+      offset <- Stream.eval(offsetRef.get)
+      result <- Stream.eval(readAll1(handle, offset, chunkSize, Stream.empty))
+      (nextOffset, bytes) = result
+      _ <- Stream.eval(if (offset == nextOffset) F.unit else offsetRef.set(nextOffset))
+    } yield bytes
+  }.flatMap(x => x)
 }
