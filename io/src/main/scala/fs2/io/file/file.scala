@@ -129,7 +129,9 @@ package object file {
       .resource(Watcher.default)
       .flatMap(w => Stream.eval_(w.watch(path, types, modifiers)) ++ w.events(pollTimeout))
 
-
+  // -----------
+  // TAIL
+  // -----------
   private val modifiers: Seq[WatchEvent.Modifier] =
     try {
       val c = Class.forName("com.sun.nio.file.SensitivityWatchEventModifier")
@@ -149,15 +151,16 @@ package object file {
       .flatMap(e => Pull.output1(e.resource))
       .stream
 
-  private def readAll1[F[_]](
+  private def readAllWithOffset[F[_]](
       handle: FileHandle[F],
       offset: Long,
       chunkSize: Int,
       stream: Stream[F, Byte]
   )(implicit F: Sync[F]): F[(Long, Stream[F, Byte])] =
     handle.read(chunkSize, offset).flatMap {
-      case None    => F.pure((offset, stream))
-      case Some(c) => readAll1(handle, offset + c.size, chunkSize, stream ++ Stream.chunk(c))
+      case None => F.pure((offset, stream))
+      case Some(c) =>
+        readAllWithOffset(handle, offset + c.size, chunkSize, stream ++ Stream.chunk(c))
     }
 
   def tail[F[_]](
@@ -170,7 +173,7 @@ package object file {
       offsetRef <- Stream.eval(Ref.of[F, Long](position))
       _ <- fileEvents(path)
       offset <- Stream.eval(offsetRef.get)
-      result <- Stream.eval(readAll1(handle, offset, chunkSize, Stream.empty))
+      result <- Stream.eval(readAllWithOffset(handle, offset, chunkSize, Stream.empty))
       (nextOffset, bytes) = result
       _ <- Stream.eval(if (offset == nextOffset) F.unit else offsetRef.set(nextOffset))
     } yield bytes
